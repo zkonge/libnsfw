@@ -1,6 +1,7 @@
 use std::{
     env::args,
     io,
+    num::NonZeroU32,
     sync::{
         mpsc::{channel, Sender},
         Arc, Mutex,
@@ -9,7 +10,8 @@ use std::{
 };
 
 use anyhow::Result;
-use image::imageops::{self, FilterType};
+use fast_image_resize as fr;
+use image::DynamicImage;
 use onnxruntime::{
     environment::Environment, ndarray::Array4, session::Session, tensor::OrtOwnedTensor,
     GraphOptimizationLevel,
@@ -18,6 +20,18 @@ use rouille::{self, input::post::BufferedFile, post_input, try_or_400, Response}
 use serde::Serialize;
 
 type TaskType = (Sender<Result<Prediction>>, Vec<u8>);
+
+macro_rules! try_anyhow_or_400 {
+    ($result:expr) => {
+        match $result {
+            Ok(r) => r,
+            Err(err) => {
+                let json = $crate::try_or_400::ErrJson::from_err(&err.root_cause());
+                return $crate::Response::json(&json).with_status_code(400);
+            }
+        }
+    };
+}
 
 #[derive(Debug, Serialize)]
 struct Prediction {
@@ -74,6 +88,29 @@ fn real_predict(session: &mut Session, image_bytes: Vec<u8>) -> Result<Predictio
     })
 }
 
+fn resize_image(img: DynamicImage) -> Result<Vec<u8>> {
+    let (src_width, src_height) = (
+        NonZeroU32::new(img.width()).ok_or_else(|| anyhow::anyhow!("wrong width"))?,
+        NonZeroU32::new(img.height()).ok_or_else(|| anyhow::anyhow!("wrong height"))?,
+    );
+    let src_img = fast_image_resize::Image::from_vec_u8(
+        src_width,
+        src_height,
+        img.to_rgb8().to_vec(),
+        fast_image_resize::PixelType::U8x3,
+    )?;
+    let src_view = src_img.view();
+
+    let (dst_width, dst_height) = (NonZeroU32::new(224).unwrap(), NonZeroU32::new(224).unwrap());
+    let mut dst_img = fr::Image::new(dst_width, dst_height, src_img.pixel_type());
+    let mut dst_view = dst_img.view_mut();
+
+    let mut resizer = fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3));
+    resizer.resize(&src_view, &mut dst_view)?;
+
+    Ok(dst_img.into_vec())
+}
+
 const HELPER: &str = r#"LibNSFW
 Minimal HTTP server provides nsfw image detection.
 more detail in https://github.com/zkonge/libnsfw
@@ -118,17 +155,11 @@ fn main() -> Result<()> {
             let post_input = try_or_400!(post_input!(request, { image: BufferedFile }));
 
             let img = try_or_400!(image::load_from_memory(&post_input.image.data));
-            let resized_img = imageops::resize(&img.to_rgb8(), 224, 224, FilterType::Lanczos3);
+            let resized_img = try_anyhow_or_400!(resize_image(img));
 
-            let prediction = p.lock().unwrap().predict(resized_img.to_vec());
+            let prediction = try_anyhow_or_400!(p.lock().unwrap().predict(resized_img));
 
-            match prediction {
-                Ok(r) => Response::json(&r),
-                Err(e) => {
-                    let json = try_or_400::ErrJson::from_err(e.root_cause());
-                    Response::json(&json).with_status_code(400)
-                }
-            }
+            Response::json(&prediction)
         })
     });
 }

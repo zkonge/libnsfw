@@ -267,6 +267,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast_image_resize"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf174e621dc44fc6118d0e3289a1286c166ac28599e15651a82da23a14a3425"
+dependencies = [
+ "num-traits",
+ "thiserror",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -478,9 +488,10 @@ checksum = "349d5a591cd28b49e1d1037471617a32ddcda5731b99419008085f72d5a53836"
 
 [[package]]
 name = "libnsfw"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
+ "fast_image_resize",
  "image",
  "onnxruntime",
  "rouille",
