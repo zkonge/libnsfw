@@ -5,7 +5,7 @@ Minimal HTTP server provides nsfw image detection.
 
 ## Usage
 ```
-./libnsfw bind_addr nsfw_modelworker_thread
+./libnsfw bind_addr nsfw_model worker_thread
 ```
 
 ### Example
