@@ -44,11 +44,13 @@ struct Prediction {
 
 struct Predictor {
     worker_channel: Sender<TaskType>,
+    input_shape: NonZeroU32,
 }
 
 impl Predictor {
     fn new(model_path: String, worker_thread: u16) -> Self {
         let (tx, rx) = channel::<TaskType>();
+        let (input_shape_tx, input_shape_rx) = channel();
         spawn(move || {
             let environment = Environment::builder().with_name("nsfw").build().unwrap();
             let mut session = environment
@@ -60,11 +62,29 @@ impl Predictor {
                 .unwrap()
                 .with_model_from_file(model_path)
                 .expect("read model failed");
+            let input_shape = session
+                .inputs
+                .first()
+                .expect("unable to get input shape")
+                .dimensions()
+                .map(|x| x.unwrap_or(0))
+                .max()
+                .unwrap();
+            let input_shape = NonZeroU32::new(input_shape as u32).unwrap();
+            input_shape_tx.send(input_shape).unwrap();
             for (result_tx, task) in rx.into_iter() {
-                result_tx.send(real_predict(&mut session, task)).unwrap();
+                result_tx
+                    .send(real_predict(&mut session, task, input_shape))
+                    .unwrap();
             }
         });
-        Predictor { worker_channel: tx }
+        Predictor {
+            worker_channel: tx,
+            input_shape: input_shape_rx.recv().unwrap(),
+        }
+    }
+    fn input_shape(&self) -> NonZeroU32 {
+        self.input_shape
     }
     fn predict(&self, image_bytes: Vec<u8>) -> Result<Prediction> {
         let (tx, rx) = channel();
@@ -73,8 +93,21 @@ impl Predictor {
     }
 }
 
-fn real_predict(session: &mut Session, image_bytes: Vec<u8>) -> Result<Prediction> {
-    let tensor = Array4::from_shape_vec((1, 224, 224, 3), image_bytes)?.mapv(|x| x as f32 / 255.);
+fn real_predict(
+    session: &mut Session,
+    image_bytes: Vec<u8>,
+    model_input_size: NonZeroU32,
+) -> Result<Prediction> {
+    let tensor = Array4::from_shape_vec(
+        (
+            1,
+            model_input_size.get() as usize,
+            model_input_size.get() as usize,
+            3,
+        ),
+        image_bytes,
+    )?
+    .mapv(|x| x as f32 / 255.);
     let outputs: Vec<OrtOwnedTensor<f32, _>> = session.run(vec![tensor])?;
     let output = outputs[0].view();
     let result = output.as_slice().unwrap();
@@ -88,7 +121,7 @@ fn real_predict(session: &mut Session, image_bytes: Vec<u8>) -> Result<Predictio
     })
 }
 
-fn resize_image(img: DynamicImage) -> Result<Vec<u8>> {
+fn resize_image(img: DynamicImage, model_input_size: NonZeroU32) -> Result<Vec<u8>> {
     let (src_width, src_height) = (
         NonZeroU32::new(img.width()).ok_or_else(|| anyhow::anyhow!("wrong width"))?,
         NonZeroU32::new(img.height()).ok_or_else(|| anyhow::anyhow!("wrong height"))?,
@@ -101,11 +134,11 @@ fn resize_image(img: DynamicImage) -> Result<Vec<u8>> {
     )?;
     let src_view = src_img.view();
 
-    let (dst_width, dst_height) = (NonZeroU32::new(224).unwrap(), NonZeroU32::new(224).unwrap());
+    let (dst_width, dst_height) = (model_input_size, model_input_size);
     let mut dst_img = fr::Image::new(dst_width, dst_height, src_img.pixel_type());
     let mut dst_view = dst_img.view_mut();
 
-    let mut resizer = fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3));
+    let mut resizer = fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
     resizer.resize(&src_view, &mut dst_view)?;
 
     Ok(dst_img.into_vec())
@@ -147,7 +180,9 @@ fn main() -> Result<()> {
         .parse()
         .expect("parse worker_thread failed");
 
-    let predictor = Arc::new(Mutex::new(Predictor::new(model_path, worker_thread)));
+    let predictor = Predictor::new(model_path, worker_thread);
+    let input_shape = predictor.input_shape();
+    let predictor = Arc::new(Mutex::new(predictor));
 
     rouille::start_server(bind_addr, move |request| {
         let p = predictor.clone();
@@ -155,11 +190,11 @@ fn main() -> Result<()> {
             let post_input = try_or_400!(post_input!(request, { image: BufferedFile }));
 
             let img = try_or_400!(image::load_from_memory(&post_input.image.data));
-            let resized_img = try_anyhow_or_400!(resize_image(img));
+            let resized_img = try_anyhow_or_400!(resize_image(img, input_shape));
 
-            let prediction = try_anyhow_or_400!(p.lock().unwrap().predict(resized_img));
+            let prediction = p.lock().unwrap().predict(resized_img);
 
-            Response::json(&prediction)
+            Response::json(&try_anyhow_or_400!(prediction))
         })
     });
 }
